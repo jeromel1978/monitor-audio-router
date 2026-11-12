@@ -14,6 +14,8 @@ window.
   device hotplugging.
 - Applies monitor-based routing to active app sessions. Monitor rules take
   precedence over app rules.
+- Checks and applies routing in a background worker, so moving a playing app
+  between displays continues to update its output while the UI is hidden.
 - Saves monitor assignments and output volume settings in `config.json`.
 - Uses a matching monitor-and-audio icon for the app window and system tray;
   its scalable source is [assets/monitor-audio-router.svg](assets/monitor-audio-router.svg).

@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -15,10 +16,12 @@ use std::io::Write;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::{w, PCWSTR};
-use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED};
+use windows::Win32::System::WinRT::{
+    RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED, RO_INIT_SINGLETHREADED,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, MessageBoxW, SetForegroundWindow, ShowWindow, MB_ICONERROR, MB_OK, SW_HIDE,
-    SW_RESTORE,
+    FindWindowW, IsIconic, IsWindowVisible, MessageBoxW, SetForegroundWindow, ShowWindow,
+    MB_ICONERROR, MB_OK, SW_HIDE, SW_RESTORE,
 };
 
 const TRAY_OPEN_ID: &str = "open-monitor-audio-router";
@@ -68,7 +71,6 @@ struct RouterApp {
     config_path: PathBuf,
     config: Config,
     snapshot: Option<platform::Snapshot>,
-    last_routes: HashMap<u32, String>,
     last_refresh: Instant,
     status: Option<String>,
     initial_volumes_applied: bool,
@@ -78,6 +80,7 @@ struct RouterApp {
     hidden_tray_menu: Option<Menu>,
     tray_menu_matches_visibility: Option<bool>,
     tray_actions: mpsc::Receiver<TrayAction>,
+    routing_status: mpsc::Receiver<String>,
     allow_exit: Arc<AtomicBool>,
 }
 
@@ -86,6 +89,7 @@ impl RouterApp {
         config_path: PathBuf,
         tray_result: Result<(TrayIcon, Menu, Menu), String>,
         tray_actions: mpsc::Receiver<TrayAction>,
+        routing_status: mpsc::Receiver<String>,
         allow_exit: Arc<AtomicBool>,
     ) -> Self {
         let (config, status) = match fs::read_to_string(&config_path) {
@@ -127,7 +131,6 @@ impl RouterApp {
             config_path,
             config,
             snapshot: None,
-            last_routes: HashMap::new(),
             last_refresh: Instant::now() - Duration::from_secs(2),
             status,
             initial_volumes_applied: false,
@@ -137,6 +140,7 @@ impl RouterApp {
             hidden_tray_menu,
             tray_menu_matches_visibility: None,
             tray_actions,
+            routing_status,
             allow_exit,
         };
         if let Some(error) = tray_error {
@@ -164,6 +168,12 @@ impl RouterApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
+    fn handle_routing_status(&mut self) {
+        for status in self.routing_status.try_iter() {
+            self.status = (!status.is_empty()).then_some(status);
         }
     }
 
@@ -210,7 +220,6 @@ impl RouterApp {
                     self.apply_configured_volumes(&snapshot);
                     self.initial_volumes_applied = true;
                 }
-                self.apply_monitor_routes(&snapshot);
                 self.snapshot = Some(snapshot);
                 self.last_refresh = Instant::now();
             }
@@ -313,7 +322,11 @@ impl RouterApp {
         }
     }
 
-    fn apply_monitor_routes(&mut self, snapshot: &platform::Snapshot) {
+    fn apply_monitor_routes(
+        config: &Config,
+        snapshot: &platform::Snapshot,
+        last_routes: &mut HashMap<u32, String>,
+    ) -> Vec<String> {
         let mut active_processes = HashMap::new();
         let mut errors = Vec::new();
         for session in snapshot
@@ -326,12 +339,11 @@ impl RouterApp {
             let Some(monitor_id) = monitor_id else {
                 continue;
             };
-            let monitor_rule = self
-                .config
+            let monitor_rule = config
                 .monitor_rules
                 .iter()
                 .find(|rule| rule.monitor.eq_ignore_ascii_case(monitor_id));
-            let app_rule = self.config.app_rules.iter().find(|rule| {
+            let app_rule = config.app_rules.iter().find(|rule| {
                 rule.process_name
                     .eq_ignore_ascii_case(&session.process_name)
             });
@@ -355,8 +367,7 @@ impl RouterApp {
             let Some(output) = output else {
                 continue;
             };
-            if self
-                .last_routes
+            if last_routes
                 .get(&session.process_id)
                 .is_some_and(|last| last == &output.id)
             {
@@ -364,20 +375,13 @@ impl RouterApp {
             }
             match platform::route_process(session.process_id, &output.id) {
                 Ok(()) => {
-                    self.last_routes
-                        .insert(session.process_id, output.id.clone());
+                    last_routes.insert(session.process_id, output.id.clone());
                 }
                 Err(error) => errors.push(format!("{}: {error}", session.process_name)),
             }
         }
-        self.last_routes
-            .retain(|process_id, _| active_processes.contains_key(process_id));
-        if !errors.is_empty() {
-            self.status = Some(format!(
-                "Could not apply one or more app routes: {}",
-                errors.join("; ")
-            ));
-        }
+        last_routes.retain(|process_id, _| active_processes.contains_key(process_id));
+        errors
     }
 
     fn set_monitor_route(&mut self, monitor: &str, device_id: Option<String>) {
@@ -388,7 +392,6 @@ impl RouterApp {
             monitor: monitor.to_string(),
             device: device_id.unwrap_or_default(),
         });
-        self.last_routes.clear();
         self.save_config();
     }
 
@@ -654,6 +657,7 @@ impl RouterApp {
 impl eframe::App for RouterApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_tray_events(ctx);
+        self.handle_routing_status();
         self.hide_to_tray_on_close(ctx);
         self.sync_restore_menu();
         let interval = Duration::from_millis(self.config.poll_interval_ms.clamp(250, 5000));
@@ -853,6 +857,9 @@ fn restore_main_window() -> bool {
     let Ok(window) = (unsafe { FindWindowW(None, w!("Monitor Audio Router")) }) else {
         return false;
     };
+    if unsafe { IsWindowVisible(window).as_bool() } && !unsafe { IsIconic(window).as_bool() } {
+        return true;
+    }
     unsafe {
         let _ = ShowWindow(window, SW_RESTORE);
         let _ = SetForegroundWindow(window);
@@ -862,7 +869,7 @@ fn restore_main_window() -> bool {
 
 fn main_window_visible() -> Option<bool> {
     let window = unsafe { FindWindowW(None, w!("Monitor Audio Router")) }.ok()?;
-    Some(unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(window) }.as_bool())
+    Some(unsafe { IsWindowVisible(window).as_bool() } && !unsafe { IsIconic(window).as_bool() })
 }
 
 fn hide_main_window() -> bool {
@@ -875,6 +882,85 @@ fn hide_main_window() -> bool {
     true
 }
 
+struct RoutingWorker {
+    stop: mpsc::Sender<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl RoutingWorker {
+    fn start(config_path: PathBuf, status_sender: mpsc::Sender<String>) -> std::io::Result<Self> {
+        let (stop_sender, stop_receiver) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("audio-routing".to_string())
+            .spawn(move || {
+                if let Err(error) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+                    let _ = status_sender.send(format!(
+                        "Could not initialize Windows Runtime for audio routing: {error}"
+                    ));
+                    return;
+                }
+
+                let mut last_routes = HashMap::new();
+                let mut last_status = None;
+                loop {
+                    let outcome = read_routing_config(&config_path).and_then(|config| {
+                        let snapshot = platform::snapshot()
+                            .map_err(|error| format!("Windows audio discovery failed: {error}"))?;
+                        let errors =
+                            RouterApp::apply_monitor_routes(&config, &snapshot, &mut last_routes);
+                        Ok((
+                            config.poll_interval_ms.clamp(250, 5000),
+                            (!errors.is_empty()).then(|| {
+                                format!(
+                                    "Could not apply one or more app routes: {}",
+                                    errors.join("; ")
+                                )
+                            }),
+                        ))
+                    });
+
+                    let (interval_ms, status) = match outcome {
+                        Ok((interval_ms, status)) => (interval_ms, status),
+                        Err(error) => (1000, Some(error)),
+                    };
+                    if status != last_status {
+                        let _ = status_sender.send(status.clone().unwrap_or_default());
+                        last_status = status;
+                    }
+
+                    match stop_receiver.recv_timeout(Duration::from_millis(interval_ms)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+                unsafe { RoUninitialize() };
+            })?;
+
+        Ok(Self {
+            stop: stop_sender,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for RoutingWorker {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn read_routing_config(path: &Path) -> Result<Config, String> {
+    match fs::read_to_string(path) {
+        Ok(data) => serde_json::from_str(&data)
+            .map_err(|error| format!("Could not parse {}: {error}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(error) => Err(format!("Could not read {}: {error}", path.display())),
+    }
+}
+
 fn main() {
     unsafe {
         if let Err(error) = RoInitialize(RO_INIT_SINGLETHREADED) {
@@ -884,6 +970,16 @@ fn main() {
     }
 
     let app_config_path = config_path();
+    let (routing_status_sender, routing_status_receiver) = mpsc::channel();
+    let routing_worker = match RoutingWorker::start(app_config_path.clone(), routing_status_sender)
+    {
+        Ok(worker) => worker,
+        Err(error) => {
+            unsafe { RoUninitialize() };
+            show_startup_error(&format!("Could not start audio routing: {error}"));
+            return;
+        }
+    };
     let (tray_action_sender, tray_action_receiver) = mpsc::channel();
     let allow_exit = Arc::new(AtomicBool::new(false));
     let icon_size = 64;
@@ -962,11 +1058,13 @@ fn main() {
                 app_config_path,
                 tray_result,
                 tray_action_receiver,
+                routing_status_receiver,
                 Arc::clone(&allow_exit),
             )))
         }),
     );
 
+    drop(routing_worker);
     unsafe { RoUninitialize() };
     if let Err(error) = result {
         show_startup_error(&format!("The application window could not start: {error}"));
